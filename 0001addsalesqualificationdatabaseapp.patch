@@ -1,0 +1,1343 @@
+From ff940073aa8abe33ef511f79b8a44a09c7a4e178 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 18 Aug 2026 10:05:40 +0000
+Subject: [PATCH] Add backend with SQLite database for sales qualification
+ persistence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Turns the static localStorage-only prototype into a real app: an Express
+server persists every qualification to a SQLite database (node:sqlite),
+exposing a REST API the frontend now calls instead of localStorage. Sellers
+can create a new qualification, work through the 6-step sales algorithm
+with autosave per field, and return later to any saved qualification from
+the home screen — all backed by durable storage instead of the browser.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WuL49yji5t6CH8VDZJrddL
+---
+ .gitignore                      |   5 +
+ README.md                       |  42 ++
+ package-lock.json               | 831 ++++++++++++++++++++++++++++++++
+ package.json                    |  16 +
+ index.html => public/index.html | 132 +++--
+ server.js                       | 151 ++++++
+ 6 files changed, 1147 insertions(+), 30 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 README.md
+ create mode 100644 package-lock.json
+ create mode 100644 package.json
+ rename index.html => public/index.html (91%)
+ create mode 100644 server.js
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..b734f70
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++node_modules/
++data/*.db
++data/*.db-journal
++data/*.db-wal
++data/*.db-shm
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..0d33f4f
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,42 @@
++# Prodajni Algoritem
++
++Aplikacija, ki prodajalca vodi skozi 6 korakov Principusovega prodajnega algoritma za kvalifikacijo B2B priložnosti, in vse odgovore shranjuje v bazo podatkov (SQLite), tako da se lahko kadarkoli vrne k obstoječi kvalifikaciji ali začne novo.
++
++## Zagon
++
++```bash
++npm install
++npm start
++```
++
++Aplikacija teče na [http://localhost:3000](http://localhost:3000) (spremenljiva s `PORT`).
++
++Baza podatkov je datoteka SQLite na `data/prodajni-algoritem.db`, ki se ustvari samodejno ob prvem zagonu. Podatki torej preživijo osvežitev strani, zaprtje brskalnika ali ponovni zagon strežnika — v nasprotju s prejšnjo različico, ki je vse hranila samo v `localStorage` brskalnika.
++
++## Kako deluje
++
++- **Nov projekt** — na domači strani prodajalec vnese stranko, projekt, prodajalca, datum in vrednost priložnosti; to ustvari nov zapis v bazi.
++- **6 korakov algoritma** — vsak korak ima 4 elemente, vsak element pa tri polja: predvidevanje (obvezno), odgovor stranke in podatek iz tretjega vira. Element je zelen, ko je predvidevanje potrjeno z virom, rumen, ko je le predvideno, rdeč, ko manjka predvidevanje.
++- **Samodejno shranjevanje** — vsaka sprememba polja se (z rahlim zamikom, da ne obremenjuje strežnika ob vsakem pritisku tipke) shrani v bazo; ob zapustitvi polja (blur) se shrani takoj.
++- **Nadzorna plošča** — pregled napredka, časovnice projekta in statusa vseh korakov za posamezno priložnost.
++- **Vrnitev h kvalifikaciji** — s seznama na domači strani prodajalec odpre kateri koli obstoječi projekt in nadaljuje natanko tam, kjer je končal.
++- **Izvoz / uvoz JSON** — projekt je mogoče izvoziti kot varnostno kopijo ali uvoziti nazaj v bazo.
++
++## Arhitektura
++
++- `server.js` — Express strežnik + REST API (`/api/projects`), podatki v SQLite prek vgrajenega Node modula `node:sqlite`.
++- `public/index.html` — enostranska aplikacija (HTML/CSS/JS brez gradnje), ki komunicira s strežnikom prek `fetch`.
++- `data/` — mapa s SQLite datoteko (izključena iz gita).
++
++### REST API
++
++| Metoda | Pot | Opis |
++|---|---|---|
++| GET | `/api/projects` | Seznam vseh kvalifikacij |
++| POST | `/api/projects` | Ustvari novo kvalifikacijo |
++| GET | `/api/projects/:id` | Podrobnosti ene kvalifikacije |
++| PUT | `/api/projects/:id` | Posodobi celoten projekt (npr. uvoz) |
++| PATCH | `/api/projects/:id/elements/:key` | Shrani en element koraka (npr. `s0e1`) |
++| DELETE | `/api/projects/:id` | Izbriši kvalifikacijo |
++
++Zahteva Node.js ≥ 22.5 (uporablja `node:sqlite`, ki je še eksperimentalen modul jedra Node.js).
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..0b4433b
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,831 @@
++{
++  "name": "prodajni-algoritem",
++  "version": "1.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "prodajni-algoritem",
++      "version": "1.0.0",
++      "dependencies": {
++        "express": "^4.19.2"
++      },
++      "engines": {
++        "node": ">=22.5.0"
++      }
++    },
++    "node_modules/accepts": {
++      "version": "1.3.8",
++      "resolved": "https://registry.npmjs.org/accepts/-/accepts-1.3.8.tgz",
++      "integrity": "sha512-PYAthTa2m2VKxuvSD3DPC/Gy+U+sOA1LAuT8mkmRuvw+NACSaeXEQ+NHcVF7rONl6qcaxV3Uuemwawk+7+SJLw==",
++      "license": "MIT",
++      "dependencies": {
++        "mime-types": "~2.1.34",
++        "negotiator": "0.6.3"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/array-flatten": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/array-flatten/-/array-flatten-1.1.1.tgz",
++      "integrity": "sha512-PCVAQswWemu6UdxsDFFX/+gVeYqKAod3D3UVm91jHwynguOwAvYPhx8nNlM++NqRcK6CxxpUafjmhIdKiHibqg==",
++      "license": "MIT"
++    },
++    "node_modules/body-parser": {
++      "version": "1.20.6",
++      "resolved": "https://registry.npmjs.org/body-parser/-/body-parser-1.20.6.tgz",
++      "integrity": "sha512-p5tAzS57i5MV9fZFDj9LeIiTZEufbSe2eDozP+ElheSUq1m74CRq1jI4mYNDdVs9vQztXFLuk/Gd6BWTdwRJ5g==",
++      "license": "MIT",
++      "dependencies": {
++        "bytes": "~3.1.2",
++        "content-type": "~1.0.5",
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "destroy": "~1.2.0",
++        "http-errors": "~2.0.1",
++        "iconv-lite": "~0.4.24",
++        "on-finished": "~2.4.1",
++        "qs": "~6.15.1",
++        "raw-body": "~2.5.3",
++        "type-is": "~1.6.18",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8",
++        "npm": "1.2.8000 || >= 1.4.16"
++      }
++    },
++    "node_modules/bytes": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/bytes/-/bytes-3.1.2.tgz",
++      "integrity": "sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/call-bind-apply-helpers": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/call-bind-apply-helpers/-/call-bind-apply-helpers-1.0.2.tgz",
++      "integrity": "sha512-Sp1ablJ0ivDkSzjcaJdxEunN5/XvksFJ2sMBFfq6x0ryhQV/2b/KwFe21cMpmHtPOSij8K99/wSfoEuTObmuMQ==",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "function-bind": "^1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/call-bound": {
++      "version": "1.0.4",
++      "resolved": "https://registry.npmjs.org/call-bound/-/call-bound-1.0.4.tgz",
++      "integrity": "sha512-+ys997U96po4Kx/ABpBCqhA9EuxJaQWDQg7295H4hBphv3IZg0boBKuwYpt4YXp6MZ5AmZQnU/tyMTlRpaSejg==",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.2",
++        "get-intrinsic": "^1.3.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/content-disposition": {
++      "version": "0.5.4",
++      "resolved": "https://registry.npmjs.org/content-disposition/-/content-disposition-0.5.4.tgz",
++      "integrity": "sha512-FveZTNuGw04cxlAiWbzi6zTAL/lhehaWbTtgluJh4/E95DqMwTmha3KZN1aAWA8cFIhHzMZUvLevkw5Rqk+tSQ==",
++      "license": "MIT",
++      "dependencies": {
++        "safe-buffer": "5.2.1"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/content-type": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/content-type/-/content-type-1.0.5.tgz",
++      "integrity": "sha512-nTjqfcBFEipKdXCv4YDQWCfmcLZKm81ldF0pAopTvyrFGVbcR6P/VAAd5G7N+0tTr8QqiU0tFadD6FK4NtJwOA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/cookie": {
++      "version": "0.7.2",
++      "resolved": "https://registry.npmjs.org/cookie/-/cookie-0.7.2.tgz",
++      "integrity": "sha512-yki5XnKuf750l50uGTllt6kKILY4nQ1eNIQatoXEByZ5dWgnKqbnqmTrBE5B4N7lrMJKQ2ytWMiTO2o0v6Ew/w==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/cookie-signature": {
++      "version": "1.0.7",
++      "resolved": "https://registry.npmjs.org/cookie-signature/-/cookie-signature-1.0.7.tgz",
++      "integrity": "sha512-NXdYc3dLr47pBkpUCHtKSwIOQXLVn8dZEuywboCOJY/osA0wFSLlSawr3KN8qXJEyX66FcONTH8EIlVuK0yyFA==",
++      "license": "MIT"
++    },
++    "node_modules/debug": {
++      "version": "2.6.9",
++      "resolved": "https://registry.npmjs.org/debug/-/debug-2.6.9.tgz",
++      "integrity": "sha512-bC7ElrdJaJnPbAP+1EotYvqZsb3ecl5wi6Bfi6BJTUcNowp6cvspg0jXznRTKDjm/E7AdgFBVeAPVMNcKGsHMA==",
++      "license": "MIT",
++      "dependencies": {
++        "ms": "2.0.0"
++      }
++    },
++    "node_modules/depd": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/depd/-/depd-2.0.0.tgz",
++      "integrity": "sha512-g7nH6P6dyDioJogAAGprGpCtVImJhpPk/roCzdb3fIh61/s/nPsfR6onyMwkCAR/OlC3yBC0lESvUoQEAssIrw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/destroy": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/destroy/-/destroy-1.2.0.tgz",
++      "integrity": "sha512-2sJGJTaXIIaR1w4iJSNoN0hnMY7Gpc/n8D4qSCJw8QqFWXf7cuAgnEHxBpweaVcPevC2l3KpjYCx3NypQQgaJg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8",
++        "npm": "1.2.8000 || >= 1.4.16"
++      }
++    },
++    "node_modules/dunder-proto": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/dunder-proto/-/dunder-proto-1.0.1.tgz",
++      "integrity": "sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.1",
++        "es-errors": "^1.3.0",
++        "gopd": "^1.2.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/ee-first": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/ee-first/-/ee-first-1.1.1.tgz",
++      "integrity": "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow==",
++      "license": "MIT"
++    },
++    "node_modules/encodeurl": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.0.tgz",
++      "integrity": "sha512-Q0n9HRi4m6JuGIV1eFlmvJB7ZEVxu93IrMyiMsGC0lrMJMWzRgx6WGquyfQgZVb31vhGgXnfmPNNXmxnOkRBrg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/es-define-property": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/es-define-property/-/es-define-property-1.0.1.tgz",
++      "integrity": "sha512-e3nRfgfUZ4rNGL232gUgX06QNyyez04KdjFrF+LTRoOXmrOgFKDg4BCdsjW8EnT69eqdYGmRpJwiPVYNrCaW3g==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/es-errors": {
++      "version": "1.3.0",
++      "resolved": "https://registry.npmjs.org/es-errors/-/es-errors-1.3.0.tgz",
++      "integrity": "sha512-Zf5H2Kxt2xjTvbJvP2ZWLEICxA6j+hAmMzIlypy4xcBg1vKVnx89Wy0GbS+kf5cwCVFFzdCFh2XSCFNULS6csw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/es-object-atoms": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/es-object-atoms/-/es-object-atoms-1.1.2.tgz",
++      "integrity": "sha512-HWcBoN6NileqtSydK2FqHbS/LoDd2pqrnQHLyJzBj4kOp/ky2MWMN694xOfkK8/SnUsW2DH7EfyVlydKCsm1Zw==",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/escape-html": {
++      "version": "1.0.3",
++      "resolved": "https://registry.npmjs.org/escape-html/-/escape-html-1.0.3.tgz",
++      "integrity": "sha512-NiSupZ4OeuGwr68lGIeym/ksIZMJodUGOSCZ/FSnTxcrekbvqrgdUxlJOMpijaKZVjAJrWrGs/6Jy8OMuyj9ow==",
++      "license": "MIT"
++    },
++    "node_modules/etag": {
++      "version": "1.8.1",
++      "resolved": "https://registry.npmjs.org/etag/-/etag-1.8.1.tgz",
++      "integrity": "sha512-aIL5Fx7mawVa300al2BnEE4iNvo1qETxLrPI/o05L7z6go7fCw1J6EQmbK4FmJ2AS7kgVF/KEZWufBfdClMcPg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/express": {
++      "version": "4.22.2",
++      "resolved": "https://registry.npmjs.org/express/-/express-4.22.2.tgz",
++      "integrity": "sha512-IuL+Elrou2ZvCFHs18/CIzy2Nzvo25nZ1/D2eIZlz7c+QUayAcYoiM2BthCjs+EBHVpjYjcuLDAiCWgeIX3X1Q==",
++      "license": "MIT",
++      "dependencies": {
++        "accepts": "~1.3.8",
++        "array-flatten": "1.1.1",
++        "body-parser": "~1.20.5",
++        "content-disposition": "~0.5.4",
++        "content-type": "~1.0.4",
++        "cookie": "~0.7.1",
++        "cookie-signature": "~1.0.6",
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "etag": "~1.8.1",
++        "finalhandler": "~1.3.1",
++        "fresh": "~0.5.2",
++        "http-errors": "~2.0.0",
++        "merge-descriptors": "1.0.3",
++        "methods": "~1.1.2",
++        "on-finished": "~2.4.1",
++        "parseurl": "~1.3.3",
++        "path-to-regexp": "~0.1.12",
++        "proxy-addr": "~2.0.7",
++        "qs": "~6.15.1",
++        "range-parser": "~1.2.1",
++        "safe-buffer": "5.2.1",
++        "send": "~0.19.0",
++        "serve-static": "~1.16.2",
++        "setprototypeof": "1.2.0",
++        "statuses": "~2.0.1",
++        "type-is": "~1.6.18",
++        "utils-merge": "1.0.1",
++        "vary": "~1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.10.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/finalhandler": {
++      "version": "1.3.2",
++      "resolved": "https://registry.npmjs.org/finalhandler/-/finalhandler-1.3.2.tgz",
++      "integrity": "sha512-aA4RyPcd3badbdABGDuTXCMTtOneUCAYH/gxoYRTZlIJdF0YPWuGqiAsIrhNnnqdXGswYk6dGujem4w80UJFhg==",
++      "license": "MIT",
++      "dependencies": {
++        "debug": "2.6.9",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "on-finished": "~2.4.1",
++        "parseurl": "~1.3.3",
++        "statuses": "~2.0.2",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/forwarded": {
++      "version": "0.2.0",
++      "resolved": "https://registry.npmjs.org/forwarded/-/forwarded-0.2.0.tgz",
++      "integrity": "sha512-buRG0fpBtRHSTCOASe6hD258tEubFoRLb4ZNA6NxMVHNw2gOcwHo9wyablzMzOA5z9xA9L1KNjk/Nt6MT9aYow==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/fresh": {
++      "version": "0.5.2",
++      "resolved": "https://registry.npmjs.org/fresh/-/fresh-0.5.2.tgz",
++      "integrity": "sha512-zJ2mQYM18rEFOudeV4GShTGIQ7RbzA7ozbU9I/XBpm7kqgMywgmylMwXHxZJmkVoYkna9d2pVXVXPdYTP9ej8Q==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/function-bind": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/function-bind/-/function-bind-1.1.2.tgz",
++      "integrity": "sha512-7XHNxH7qX9xG5mIwxkhumTox/MIRNcOgDrxWsMt2pAr23WHp6MrRlN7FBSFpCpr+oVO0F744iUgR82nJMfG2SA==",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/get-intrinsic": {
++      "version": "1.3.0",
++      "resolved": "https://registry.npmjs.org/get-intrinsic/-/get-intrinsic-1.3.0.tgz",
++      "integrity": "sha512-9fSjSaos/fRIVIp+xSJlE6lfwhES7LNtKaCBIamHsjr2na1BiABJPo0mOjjz8GJDURarmCPGqaiVg5mfjb98CQ==",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.2",
++        "es-define-property": "^1.0.1",
++        "es-errors": "^1.3.0",
++        "es-object-atoms": "^1.1.1",
++        "function-bind": "^1.1.2",
++        "get-proto": "^1.0.1",
++        "gopd": "^1.2.0",
++        "has-symbols": "^1.1.0",
++        "hasown": "^2.0.2",
++        "math-intrinsics": "^1.1.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/get-proto": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/get-proto/-/get-proto-1.0.1.tgz",
++      "integrity": "sha512-sTSfBjoXBp89JvIKIefqw7U2CCebsc74kiY6awiGogKtoSGbgjYE/G/+l9sF3MWFPNc9IcoOC4ODfKHfxFmp0g==",
++      "license": "MIT",
++      "dependencies": {
++        "dunder-proto": "^1.0.1",
++        "es-object-atoms": "^1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/gopd": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/gopd/-/gopd-1.2.0.tgz",
++      "integrity": "sha512-ZUKRh6/kUFoAiTAtTYPZJ3hw9wNxx+BIBOijnlG9PnrJsCcSjs1wyyD6vJpaYtgnzDrKYRSqf3OO6Rfa93xsRg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/has-symbols": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/has-symbols/-/has-symbols-1.1.0.tgz",
++      "integrity": "sha512-1cDNdwJ2Jaohmb3sg4OmKaMBwuC48sYni5HUw2DvsC8LjGTLK9h+eb1X6RyuOHe4hT0ULCW68iomhjUoKUqlPQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/hasown": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.4.tgz",
++      "integrity": "sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==",
++      "license": "MIT",
++      "dependencies": {
++        "function-bind": "^1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/http-errors": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/http-errors/-/http-errors-2.0.1.tgz",
++      "integrity": "sha512-4FbRdAX+bSdmo4AUFuS0WNiPz8NgFt+r8ThgNWmlrjQjt1Q7ZR9+zTlce2859x4KSXrwIsaeTqDoKQmtP8pLmQ==",
++      "license": "MIT",
++      "dependencies": {
++        "depd": "~2.0.0",
++        "inherits": "~2.0.4",
++        "setprototypeof": "~1.2.0",
++        "statuses": "~2.0.2",
++        "toidentifier": "~1.0.1"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/iconv-lite": {
++      "version": "0.4.24",
++      "resolved": "https://registry.npmjs.org/iconv-lite/-/iconv-lite-0.4.24.tgz",
++      "integrity": "sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==",
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/inherits": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/inherits/-/inherits-2.0.4.tgz",
++      "integrity": "sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==",
++      "license": "ISC"
++    },
++    "node_modules/ipaddr.js": {
++      "version": "1.9.1",
++      "resolved": "https://registry.npmjs.org/ipaddr.js/-/ipaddr.js-1.9.1.tgz",
++      "integrity": "sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.10"
++      }
++    },
++    "node_modules/math-intrinsics": {
++      "version": "1.1.0",
++      "resolved": "https://registry.npmjs.org/math-intrinsics/-/math-intrinsics-1.1.0.tgz",
++      "integrity": "sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/media-typer": {
++      "version": "0.3.0",
++      "resolved": "https://registry.npmjs.org/media-typer/-/media-typer-0.3.0.tgz",
++      "integrity": "sha512-dq+qelQ9akHpcOl/gUVRTxVIOkAJ1wR3QAvb4RsVjS8oVoFjDGTc679wJYmUmknUF5HwMLOgb5O+a3KxfWapPQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/merge-descriptors": {
++      "version": "1.0.3",
++      "resolved": "https://registry.npmjs.org/merge-descriptors/-/merge-descriptors-1.0.3.tgz",
++      "integrity": "sha512-gaNvAS7TZ897/rVaZ0nMtAyxNyi/pdbjbAwUpFQpN70GqnVfOiXpeUUMKRBmzXaSQ8DdTX4/0ms62r2K+hE6mQ==",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
++    "node_modules/methods": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/methods/-/methods-1.1.2.tgz",
++      "integrity": "sha512-iclAHeNqNm68zFtnZ0e+1L2yUIdvzNoauKU4WBA3VvH/vPFieF7qfRlwUZU+DA9P9bPXIS90ulxoUoCH23sV2w==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/mime": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/mime/-/mime-1.6.0.tgz",
++      "integrity": "sha512-x0Vn8spI+wuJ1O6S7gnbaQg8Pxh4NNHb7KSINmEWKiPE4RKOplvijn+NkmYmmRgP68mc70j2EbeTFRsrswaQeg==",
++      "license": "MIT",
++      "bin": {
++        "mime": "cli.js"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/mime-db": {
++      "version": "1.52.0",
++      "resolved": "https://registry.npmjs.org/mime-db/-/mime-db-1.52.0.tgz",
++      "integrity": "sha512-sPU4uV7dYlvtWJxwwxHD0PuihVNiE7TyAbQ5SWxDCB9mUYvOgroQOwYQQOKPJ8CIbE+1ETVlOoK1UC2nU3gYvg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/mime-types": {
++      "version": "2.1.35",
++      "resolved": "https://registry.npmjs.org/mime-types/-/mime-types-2.1.35.tgz",
++      "integrity": "sha512-ZDY+bPm5zTTF+YpCrAU9nK0UgICYPT0QtT1NZWFv4s++TNkcgVaT0g6+4R2uI4MjQjzysHB1zxuWL50hzaeXiw==",
++      "license": "MIT",
++      "dependencies": {
++        "mime-db": "1.52.0"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/ms": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.0.0.tgz",
++      "integrity": "sha512-Tpp60P6IUJDTuOq/5Z8cdskzJujfwqfOTkrwIwj7IRISpnkJnT6SyJ4PCPnGMoFjC9ddhal5KVIYtAt97ix05A==",
++      "license": "MIT"
++    },
++    "node_modules/negotiator": {
++      "version": "0.6.3",
++      "resolved": "https://registry.npmjs.org/negotiator/-/negotiator-0.6.3.tgz",
++      "integrity": "sha512-+EUsqGPLsM+j/zdChZjsnX51g4XrHFOIXwfnCVPGlQk/k5giakcKsuxCObBRu6DSm9opw/O6slWbJdghQM4bBg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/object-inspect": {
++      "version": "1.13.4",
++      "resolved": "https://registry.npmjs.org/object-inspect/-/object-inspect-1.13.4.tgz",
++      "integrity": "sha512-W67iLl4J2EXEGTbfeHCffrjDfitvLANg0UlX3wFUUSTx92KXRFegMHUVgSqE+wvhAbi4WqjGg9czysTV2Epbew==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/on-finished": {
++      "version": "2.4.1",
++      "resolved": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
++      "integrity": "sha512-oVlzkg3ENAhCk2zdv7IJwd/QUD4z2RxRwpkcGY8psCVcCYZNq4wYnVWALHM+brtuJjePWiYF/ClmuDr8Ch5+kg==",
++      "license": "MIT",
++      "dependencies": {
++        "ee-first": "1.1.1"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/parseurl": {
++      "version": "1.3.3",
++      "resolved": "https://registry.npmjs.org/parseurl/-/parseurl-1.3.3.tgz",
++      "integrity": "sha512-CiyeOxFT/JZyN5m0z9PfXw4SCBJ6Sygz1Dpl0wqjlhDEGGBP1GnsUVEL0p63hoG1fcj3fHynXi9NYO4nWOL+qQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/path-to-regexp": {
++      "version": "0.1.13",
++      "resolved": "https://registry.npmjs.org/path-to-regexp/-/path-to-regexp-0.1.13.tgz",
++      "integrity": "sha512-A/AGNMFN3c8bOlvV9RreMdrv7jsmF9XIfDeCd87+I8RNg6s78BhJxMu69NEMHBSJFxKidViTEdruRwEk/WIKqA==",
++      "license": "MIT"
++    },
++    "node_modules/proxy-addr": {
++      "version": "2.0.7",
++      "resolved": "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.7.tgz",
++      "integrity": "sha512-llQsMLSUDUPT44jdrU/O37qlnifitDP+ZwrmmZcoSKyLKvtZxpyV0n2/bD/N4tBAAZ/gJEdZU7KMraoK1+XYAg==",
++      "license": "MIT",
++      "dependencies": {
++        "forwarded": "0.2.0",
++        "ipaddr.js": "1.9.1"
++      },
++      "engines": {
++        "node": ">= 0.10"
++      }
++    },
++    "node_modules/qs": {
++      "version": "6.15.3",
++      "resolved": "https://registry.npmjs.org/qs/-/qs-6.15.3.tgz",
++      "integrity": "sha512-O9gl3zCl5h5blw1KGUzQKhA5oUXSl8rwUIM5o0S3nCXMliSvy5Dzx7/DJcI+SwgICv+IneSZwhBh1oSyEHA71A==",
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "es-define-property": "^1.0.1",
++        "side-channel": "^1.1.1"
++      },
++      "engines": {
++        "node": ">=0.6"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/range-parser": {
++      "version": "1.2.1",
++      "resolved": "https://registry.npmjs.org/range-parser/-/range-parser-1.2.1.tgz",
++      "integrity": "sha512-Hrgsx+orqoygnmhFbKaHE6c296J+HTAQXoxEF6gNupROmmGJRoyzfG3ccAveqCBrwr/2yxQ5BVd/GTl5agOwSg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/raw-body": {
++      "version": "2.5.3",
++      "resolved": "https://registry.npmjs.org/raw-body/-/raw-body-2.5.3.tgz",
++      "integrity": "sha512-s4VSOf6yN0rvbRZGxs8Om5CWj6seneMwK3oDb4lWDH0UPhWcxwOWw5+qk24bxq87szX1ydrwylIOp2uG1ojUpA==",
++      "license": "MIT",
++      "dependencies": {
++        "bytes": "~3.1.2",
++        "http-errors": "~2.0.1",
++        "iconv-lite": "~0.4.24",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/safe-buffer": {
++      "version": "5.2.1",
++      "resolved": "https://registry.npmjs.org/safe-buffer/-/safe-buffer-5.2.1.tgz",
++      "integrity": "sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/safer-buffer": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/safer-buffer/-/safer-buffer-2.1.2.tgz",
++      "integrity": "sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==",
++      "license": "MIT"
++    },
++    "node_modules/send": {
++      "version": "0.19.2",
++      "resolved": "https://registry.npmjs.org/send/-/send-0.19.2.tgz",
++      "integrity": "sha512-VMbMxbDeehAxpOtWJXlcUS5E8iXh6QmN+BkRX1GARS3wRaXEEgzCcB10gTQazO42tpNIya8xIyNx8fll1OFPrg==",
++      "license": "MIT",
++      "dependencies": {
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "destroy": "1.2.0",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "etag": "~1.8.1",
++        "fresh": "~0.5.2",
++        "http-errors": "~2.0.1",
++        "mime": "1.6.0",
++        "ms": "2.1.3",
++        "on-finished": "~2.4.1",
++        "range-parser": "~1.2.1",
++        "statuses": "~2.0.2"
++      },
++      "engines": {
++        "node": ">= 0.8.0"
++      }
++    },
++    "node_modules/send/node_modules/ms": {
++      "version": "2.1.3",
++      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
++      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
++      "license": "MIT"
++    },
++    "node_modules/serve-static": {
++      "version": "1.16.3",
++      "resolved": "https://registry.npmjs.org/serve-static/-/serve-static-1.16.3.tgz",
++      "integrity": "sha512-x0RTqQel6g5SY7Lg6ZreMmsOzncHFU7nhnRWkKgWuMTu5NN0DR5oruckMqRvacAN9d5w6ARnRBXl9xhDCgfMeA==",
++      "license": "MIT",
++      "dependencies": {
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "parseurl": "~1.3.3",
++        "send": "~0.19.1"
++      },
++      "engines": {
++        "node": ">= 0.8.0"
++      }
++    },
++    "node_modules/setprototypeof": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/setprototypeof/-/setprototypeof-1.2.0.tgz",
++      "integrity": "sha512-E5LDX7Wrp85Kil5bhZv46j8jOeboKq5JMmYM3gVGdGH8xFpPWXUMsNrlODCrkoxMEeNi/XZIwuRvY4XNwYMJpw==",
++      "license": "ISC"
++    },
++    "node_modules/side-channel": {
++      "version": "1.1.1",
++      "resolved": "https://registry.npmjs.org/side-channel/-/side-channel-1.1.1.tgz",
++      "integrity": "sha512-6x6dK6zJdpTzF4sQeNYxwtvBzf6Eg4GtlesS94HOvTudUeyK2WXAaIfmDgsyslYrRBeFIlsi54AYsFGUuhmvrQ==",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "object-inspect": "^1.13.4",
++        "side-channel-list": "^1.0.1",
++        "side-channel-map": "^1.0.1",
++        "side-channel-weakmap": "^1.0.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-list": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/side-channel-list/-/side-channel-list-1.0.1.tgz",
++      "integrity": "sha512-mjn/0bi/oUURjc5Xl7IaWi/OJJJumuoJFQJfDDyO46+hBWsfaVM65TBHq2eoZBhzl9EchxOijpkbRC8SVBQU0w==",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "object-inspect": "^1.13.4"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-map": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/side-channel-map/-/side-channel-map-1.0.1.tgz",
++      "integrity": "sha512-VCjCNfgMsby3tTdo02nbjtM/ewra6jPHmpThenkTYh8pG9ucZ/1P8So4u4FGBek/BjpOVsDCMoLA/iuBKIFXRA==",
++      "license": "MIT",
++      "dependencies": {
++        "call-bound": "^1.0.2",
++        "es-errors": "^1.3.0",
++        "get-intrinsic": "^1.2.5",
++        "object-inspect": "^1.13.3"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-weakmap": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/side-channel-weakmap/-/side-channel-weakmap-1.0.2.tgz",
++      "integrity": "sha512-WPS/HvHQTYnHisLo9McqBHOJk2FkHO/tlpvldyrnem4aeQp4hai3gythswg6p01oSoTl58rcpiFAjF2br2Ak2A==",
++      "license": "MIT",
++      "dependencies": {
++        "call-bound": "^1.0.2",
++        "es-errors": "^1.3.0",
++        "get-intrinsic": "^1.2.5",
++        "object-inspect": "^1.13.3",
++        "side-channel-map": "^1.0.1"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/statuses": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/statuses/-/statuses-2.0.2.tgz",
++      "integrity": "sha512-DvEy55V3DB7uknRo+4iOGT5fP1slR8wQohVdknigZPMpMstaKJQWhwiYBACJE3Ul2pTnATihhBYnRhZQHGBiRw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/toidentifier": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/toidentifier/-/toidentifier-1.0.1.tgz",
++      "integrity": "sha512-o5sSPKEkg/DIQNmH43V0/uerLrpzVedkUh8tGNvaeXpfpuwjKenlSox/2O/BTlZUtEe+JG7s5YhEz608PlAHRA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.6"
++      }
++    },
++    "node_modules/type-is": {
++      "version": "1.6.18",
++      "resolved": "https://registry.npmjs.org/type-is/-/type-is-1.6.18.tgz",
++      "integrity": "sha512-TkRKr9sUTxEH8MdfuCSP7VizJyzRNMjj2J2do2Jr3Kym598JVdEksuzPQCnlFPW4ky9Q+iA+ma9BGm06XQBy8g==",
++      "license": "MIT",
++      "dependencies": {
++        "media-typer": "0.3.0",
++        "mime-types": "~2.1.24"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/unpipe": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/unpipe/-/unpipe-1.0.0.tgz",
++      "integrity": "sha512-pjy2bYhSsufwWlKwPc+l3cN7+wuJlK6uz0YdJEOlQDbl6jo/YlPi4mb8agUkVC8BF7V8NuzeyPNqRksA3hztKQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/utils-merge": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/utils-merge/-/utils-merge-1.0.1.tgz",
++      "integrity": "sha512-pMZTvIkT1d+TFGvDOqodOclx0QWkkgi6Tdoa8gC8ffGAAqz9pzPTZWAybbsHHoED/ztMtkv/VoYTYyShUn81hA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4.0"
++      }
++    },
++    "node_modules/vary": {
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/vary/-/vary-1.1.2.tgz",
++      "integrity": "sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    }
++  }
++}
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..951b54c
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,16 @@
++{
++  "name": "prodajni-algoritem",
++  "version": "1.0.0",
++  "description": "Principus prodajni algoritem — vodenje prodajalca skozi kvalifikacijo priložnosti s shranjevanjem v bazo.",
++  "private": true,
++  "main": "server.js",
++  "scripts": {
++    "start": "node server.js"
++  },
++  "engines": {
++    "node": ">=22.5.0"
++  },
++  "dependencies": {
++    "express": "^4.19.2"
++  }
++}
+diff --git a/index.html b/public/index.html
+similarity index 91%
+rename from index.html
+rename to public/index.html
+index 8c190d2..b0468d3 100644
+--- a/index.html
++++ b/public/index.html
+@@ -443,7 +443,6 @@
+     .modal { border-radius: 14px; max-width: 460px; padding: 26px; }
+     .modal-handle { display: none; }
+     .modal-btns { justify-content: flex-end; }
+-    .modal-btns .btn { flex: none; }
+     .notif { bottom: 24px; }
+     .step-wrap { padding: 22px 24px 0; }
+   }
+@@ -627,14 +626,30 @@ const ALG = [
+ ];
+ 
+ // ═══ STATE ════════════════════════════════════════════════════════════════════
+-let projects = JSON.parse(localStorage.getItem('pa2_projects') || '[]');
++let projects = [];
+ let curId = null, curStep = 0, delId = null;
+ let expanded = {};
++const elSaveTimers = {};
+ 
+-const save = () => localStorage.setItem('pa2_projects', JSON.stringify(projects));
+ const getP = id => projects.find(p => p.id === id);
+ const curP = () => getP(curId);
+ 
++// ═══ API ═════════════════════════════════════════════════════════════════════
++async function apiGet(url) {
++  const res = await fetch(url);
++  if (!res.ok) throw new Error('request_failed');
++  return res.json();
++}
++async function apiSend(url, method, body) {
++  const res = await fetch(url, {
++    method,
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body || {})
++  });
++  if (!res.ok) throw new Error('request_failed');
++  return res.json();
++}
++
+ // ═══ STATUS ══════════════════════════════════════════════════════════════════
+ function elSt(el) {
+   const p = el.pred?.trim(), o = el.odg?.trim(), v = el.vir?.trim();
+@@ -676,20 +691,24 @@ function showForm() {
+ }
+ function hideForm(){ document.getElementById('newForm').style.display='none'; }
+ 
+-function createProject() {
++async function createProject() {
+   const c=document.getElementById('np_c').value.trim();
+   const p=document.getElementById('np_p').value.trim();
+   if(!c||!p){notify('Vnesite ime stranke in projekta.','wrn');return;}
+-  const proj = {
+-    id: Date.now()+'', customer:c, project:p,
++  const body = {
++    customer:c, project:p,
+     seller: document.getElementById('np_s').value.trim(),
+     startdate: document.getElementById('np_d').value || new Date().toISOString().split('T')[0],
+-    value: document.getElementById('np_v').value||'',
+-    createdAt: new Date().toISOString(), els:{}
++    value: document.getElementById('np_v').value||''
+   };
+-  projects.unshift(proj); save(); hideForm();
+-  ['np_c','np_p','np_s','np_v'].forEach(id=>document.getElementById(id).value='');
+-  curId=proj.id; showV('vDash'); renderDash();
++  try {
++    const proj = await apiSend('/api/projects', 'POST', body);
++    projects.unshift(proj); hideForm();
++    ['np_c','np_p','np_s','np_v'].forEach(id=>document.getElementById(id).value='');
++    curId=proj.id; showV('vDash'); renderDash();
++  } catch (e) {
++    notify('Napaka pri shranjevanju v bazo.','wrn');
++  }
+ }
+ 
+ function renderHome() {
+@@ -807,25 +826,25 @@ function renderStep() {
+         <div class="desktop-cols">
+           <div class="fpanel on" id="p0_${key}">
+             <div class="flbl"><div class="fdot ${hp?'f':''}"></div>Predvidevanje *</div>
+-            <textarea id="pred_${key}" placeholder="Vaše predvidevanje ali hipoteza…" oninput="fi('${key}')">${x(el.pred||'')}</textarea>
++            <textarea id="pred_${key}" placeholder="Vaše predvidevanje ali hipoteza…" oninput="fi('${key}')" onblur="flushEl('${key}')">${x(el.pred||'')}</textarea>
+           </div>
+           <div class="fpanel ${aTab===1?'on':''}" id="p1_${key}">
+             <div class="flbl"><div class="fdot ${ho?'f':''}"></div>Odgovor stranke</div>
+-            <textarea id="odg_${key}" placeholder="Kar je stranka povedala…" oninput="fi('${key}')">${x(el.odg||'')}</textarea>
++            <textarea id="odg_${key}" placeholder="Kar je stranka povedala…" oninput="fi('${key}')" onblur="flushEl('${key}')">${x(el.odg||'')}</textarea>
+           </div>
+           <div class="fpanel ${aTab===2?'on':''}" id="p2_${key}">
+             <div class="flbl"><div class="fdot ${hv?'f':''}"></div>Podatek iz tretjega vira</div>
+-            <textarea id="vir_${key}" placeholder="Javni vir, analiza, poizvedba…" oninput="fi('${key}')">${x(el.vir||'')}</textarea>
++            <textarea id="vir_${key}" placeholder="Javni vir, analiza, poizvedba…" oninput="fi('${key}')" onblur="flushEl('${key}')">${x(el.vir||'')}</textarea>
+           </div>
+           <div class="skip-box ${needSkip?'on':''}" id="sk_${key}">
+             <div class="skip-lbl">⚠ Predvidevanje je obvezno. Kdaj boste pridobili podatek?</div>
+-            <input type="date" id="sd_${key}" value="${x(el.skip||'')}" onchange="fi('${key}')">
++            <input type="date" id="sd_${key}" value="${x(el.skip||'')}" onchange="fi('${key}');flushEl('${key}')">
+           </div>
+         </div>
+       </div>
+       <div class="el-foot">
+         <span id="ft_${key}">${el.skip&&needSkip?'⏳ Rok: '+fd(el.skip):''}</span>
+-        <span>Shranjeno</span>
++        <span id="fs_${key}">Shranjeno</span>
+       </div>`;
+     cont.appendChild(card);
+   });
+@@ -874,17 +893,50 @@ function fi(key){
+   if(ft)ft.textContent=(el.skip&&!hp)?'⏳ Rok: '+fd(el.skip):'';
+ }
+ 
++// Local state is updated immediately; the write to the database is
++// debounced per element so we don't fire a request on every keystroke.
+ function saveEl(key){
+   const p=curP(); if(!p)return;
+   const pred=document.getElementById(`pred_${key}`);
+   if(!pred)return;
+-  p.els[key]={
++  const data = {
+     pred: pred.value,
+     odg:  (document.getElementById(`odg_${key}`)?.value)||'',
+     vir:  (document.getElementById(`vir_${key}`)?.value)||'',
+     skip: (document.getElementById(`sd_${key}`)?.value)||''
+   };
+-  save();
++  p.els[key]=data;
++  scheduleElSave(p.id, key, data);
++}
++
++function scheduleElSave(projId, key, data){
++  const tk = `${projId}_${key}`;
++  clearTimeout(elSaveTimers[tk]);
++  setSaveStatus(key,'saving');
++  elSaveTimers[tk] = setTimeout(()=>doSaveNow(projId,key,data), 600);
++}
++
++async function doSaveNow(projId, key, data){
++  try {
++    await apiSend(`/api/projects/${projId}/elements/${key}`, 'PATCH', data);
++    setSaveStatus(key,'saved');
++  } catch (e) {
++    setSaveStatus(key,'error');
++  }
++}
++
++function flushEl(key){
++  const p=curP(); if(!p)return;
++  const data=p.els[key]; if(!data)return;
++  const tk = `${p.id}_${key}`;
++  clearTimeout(elSaveTimers[tk]);
++  doSaveNow(p.id, key, data);
++}
++
++function setSaveStatus(key, status){
++  const el=document.getElementById(`fs_${key}`); if(!el)return;
++  el.textContent = status==='saving' ? 'Shranjujem…' : status==='error' ? 'Napaka pri shranjevanju' : 'Shranjeno';
++  el.style.color = status==='error' ? 'var(--red)' : '';
+ }
+ 
+ function saveFields(){
+@@ -900,11 +952,18 @@ function askDel(id){
+     `Brisanje projekta "${p.customer} — ${p.project}". Tega dejanja ni mogoče razveljaviti.`;
+   document.getElementById('mDel').classList.add('on');
+ }
+-function doDelete(){
+-  projects=projects.filter(p=>p.id!==delId); save();
+-  closeM('mDel');
+-  if(curId===delId){curId=null;goHome();}else renderHome();
+-  notify('Projekt izbrisan.');
++async function doDelete(){
++  const id=delId;
++  try {
++    const res = await fetch(`/api/projects/${id}`, { method:'DELETE' });
++    if(!res.ok) throw new Error('delete_failed');
++    projects=projects.filter(p=>p.id!==id);
++    closeM('mDel');
++    if(curId===id){curId=null;goHome();}else renderHome();
++    notify('Projekt izbrisan.');
++  } catch (e) {
++    notify('Napaka pri brisanju iz baze.','wrn');
++  }
+ }
+ function closeM(id){ document.getElementById(id).classList.remove('on'); delId=null; }
+ 
+@@ -917,13 +976,18 @@ function exportProj(){
+   a.click(); URL.revokeObjectURL(url); notify('Projekt izvožen!');
+ }
+ function showImport(){ document.getElementById('impTxt').value=''; document.getElementById('mImp').classList.add('on'); }
+-function doImport(){
++async function doImport(){
++  let data;
+   try{
+-    const data=JSON.parse(document.getElementById('impTxt').value.trim());
++    data=JSON.parse(document.getElementById('impTxt').value.trim());
+     if(!data.customer||!data.project)throw 0;
+-    data.id=Date.now()+''; data.els=data.els||{};
+-    projects.unshift(data); save(); closeM('mImp'); renderHome(); notify('Projekt uvožen!');
+-  }catch{notify('Napaka: Neveljavni JSON.','wrn');}
++  }catch{notify('Napaka: Neveljavni JSON.','wrn');return;}
++  try {
++    const proj = await apiSend('/api/projects', 'POST', data);
++    projects.unshift(proj); closeM('mImp'); renderHome(); notify('Projekt uvožen!');
++  } catch (e) {
++    notify('Napaka pri uvozu v bazo.','wrn');
++  }
+ }
+ 
+ // ═══ UTILS ═══════════════════════════════════════════════════════════════════
+@@ -947,8 +1011,16 @@ function notify(msg,type='suc'){
+ }
+ 
+ // ═══ INIT ════════════════════════════════════════════════════════════════════
+-renderHome();
+-if(!projects.length)showForm();
++(async function init(){
++  try {
++    projects = await apiGet('/api/projects');
++  } catch (e) {
++    projects = [];
++    notify('Ni povezave z bazo podatkov.','wrn');
++  }
++  renderHome();
++  if(!projects.length) showForm();
++})();
+ </script>
+ </body>
+ </html>
+diff --git a/server.js b/server.js
+new file mode 100644
+index 0000000..044f44c
+--- /dev/null
++++ b/server.js
+@@ -0,0 +1,151 @@
++const path = require('node:path');
++const fs = require('node:fs');
++const { DatabaseSync } = require('node:sqlite');
++const express = require('express');
++
++const DATA_DIR = path.join(__dirname, 'data');
++const DB_PATH = path.join(DATA_DIR, 'prodajni-algoritem.db');
++fs.mkdirSync(DATA_DIR, { recursive: true });
++
++const db = new DatabaseSync(DB_PATH);
++db.exec(`
++  CREATE TABLE IF NOT EXISTS projects (
++    id TEXT PRIMARY KEY,
++    customer TEXT NOT NULL,
++    project TEXT NOT NULL,
++    seller TEXT DEFAULT '',
++    startdate TEXT DEFAULT '',
++    value TEXT DEFAULT '',
++    createdAt TEXT NOT NULL,
++    updatedAt TEXT NOT NULL,
++    els TEXT NOT NULL DEFAULT '{}'
++  );
++`);
++
++function rowToProject(row) {
++  if (!row) return null;
++  return {
++    id: row.id,
++    customer: row.customer,
++    project: row.project,
++    seller: row.seller || '',
++    startdate: row.startdate || '',
++    value: row.value || '',
++    createdAt: row.createdAt,
++    updatedAt: row.updatedAt,
++    els: JSON.parse(row.els || '{}'),
++  };
++}
++
++const stmts = {
++  listAll: db.prepare('SELECT * FROM projects ORDER BY createdAt DESC'),
++  getOne: db.prepare('SELECT * FROM projects WHERE id = ?'),
++  insert: db.prepare(`
++    INSERT INTO projects (id, customer, project, seller, startdate, value, createdAt, updatedAt, els)
++    VALUES (@id, @customer, @project, @seller, @startdate, @value, @createdAt, @updatedAt, @els)
++  `),
++  replace: db.prepare(`
++    UPDATE projects SET customer=@customer, project=@project, seller=@seller,
++      startdate=@startdate, value=@value, updatedAt=@updatedAt, els=@els
++    WHERE id=@id
++  `),
++  updateEls: db.prepare('UPDATE projects SET els=@els, updatedAt=@updatedAt WHERE id=@id'),
++  remove: db.prepare('DELETE FROM projects WHERE id = ?'),
++};
++
++function genId() {
++  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
++}
++
++const app = express();
++app.use(express.json({ limit: '2mb' }));
++app.use(express.static(path.join(__dirname, 'public')));
++
++const api = express.Router();
++
++api.get('/projects', (req, res) => {
++  const rows = stmts.listAll.all();
++  res.json(rows.map(rowToProject));
++});
++
++api.get('/projects/:id', (req, res) => {
++  const row = stmts.getOne.get(req.params.id);
++  if (!row) return res.status(404).json({ error: 'not_found' });
++  res.json(rowToProject(row));
++});
++
++api.post('/projects', (req, res) => {
++  const b = req.body || {};
++  if (!b.customer || !b.customer.trim() || !b.project || !b.project.trim()) {
++    return res.status(400).json({ error: 'customer_and_project_required' });
++  }
++  const now = new Date().toISOString();
++  const project = {
++    id: genId(),
++    customer: b.customer.trim(),
++    project: b.project.trim(),
++    seller: (b.seller || '').trim(),
++    startdate: b.startdate || now.split('T')[0],
++    value: b.value != null ? String(b.value) : '',
++    createdAt: b.createdAt || now,
++    updatedAt: now,
++    els: b.els && typeof b.els === 'object' ? b.els : {},
++  };
++  stmts.insert.run({ ...project, els: JSON.stringify(project.els) });
++  res.status(201).json(project);
++});
++
++api.put('/projects/:id', (req, res) => {
++  const existing = stmts.getOne.get(req.params.id);
++  if (!existing) return res.status(404).json({ error: 'not_found' });
++  const b = req.body || {};
++  const updated = {
++    id: req.params.id,
++    customer: (b.customer ?? existing.customer).trim(),
++    project: (b.project ?? existing.project).trim(),
++    seller: (b.seller ?? existing.seller ?? '').trim(),
++    startdate: b.startdate ?? existing.startdate ?? '',
++    value: b.value != null ? String(b.value) : (existing.value || ''),
++    updatedAt: new Date().toISOString(),
++    els: b.els && typeof b.els === 'object' ? b.els : JSON.parse(existing.els || '{}'),
++  };
++  stmts.replace.run({ ...updated, els: JSON.stringify(updated.els) });
++  res.json(rowToProject(stmts.getOne.get(req.params.id)));
++});
++
++api.patch('/projects/:id/elements/:key', (req, res) => {
++  const existing = stmts.getOne.get(req.params.id);
++  if (!existing) return res.status(404).json({ error: 'not_found' });
++  if (!/^s\d+e\d+$/.test(req.params.key)) {
++    return res.status(400).json({ error: 'invalid_key' });
++  }
++  const els = JSON.parse(existing.els || '{}');
++  const b = req.body || {};
++  els[req.params.key] = {
++    pred: b.pred || '',
++    odg: b.odg || '',
++    vir: b.vir || '',
++    skip: b.skip || '',
++  };
++  const updatedAt = new Date().toISOString();
++  stmts.updateEls.run({ id: req.params.id, els: JSON.stringify(els), updatedAt });
++  res.json({ ok: true, updatedAt });
++});
++
++api.delete('/projects/:id', (req, res) => {
++  const result = stmts.remove.run(req.params.id);
++  if (result.changes === 0) return res.status(404).json({ error: 'not_found' });
++  res.json({ ok: true });
++});
++
++app.use('/api', api);
++
++app.get('/', (req, res) => {
++  res.sendFile(path.join(__dirname, 'public', 'index.html'));
++});
++
++const PORT = process.env.PORT || 3000;
++app.listen(PORT, () => {
++  console.log(`Prodajni algoritem teče na http://localhost:${PORT}`);
++  console.log(`Baza podatkov: ${DB_PATH}`);
++});
+-- 
+2.43.0
+
